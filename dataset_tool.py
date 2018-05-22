@@ -26,6 +26,19 @@ def error(msg):
     exit(1)
 
 #----------------------------------------------------------------------------
+FACIAL_LANDMARKS_IDXS = collections.OrderedDict([
+    ("mouth", (48, 68)),
+    ("right_eyebrow", (17, 22)),
+    ("left_eyebrow", (22, 27)),
+    ("right_eye", (36, 42)),
+    ("left_eye", (42, 48)),
+    ("nose", (27, 35)),
+    ("jaw", (0, 17))
+])
+
+predictor_path = ''
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor(predictor_path)
 
 class TFRecordExporter:
     def __init__(self, tfrecord_dir, expected_images, print_progress=True, progress_interval=10):
@@ -59,9 +72,68 @@ class TFRecordExporter:
         np.random.RandomState(123).shuffle(order)
         return order
 
+    def visualize_facial_landmarks(image, shape, colors=None, alpha=0.75):
+        # create two copies of the input image -- one for the
+        # overlay and one for the final output image
+        overlay = np.ones(image.shape) * 10
+        output = image.copy()
+     
+        # if the colors list is None, initialize it with a unique
+        # color for each facial landmark region
+        if colors is None:
+            colors = [(245, 10, 10), (10, 245, 245), (70, 245, 245),
+                (10, 10, 245), (10, 10, 245),
+                (245, 245, 10), (199, 71, 133)]
+
+
+        hull = cv2.convexHull(shape)
+        cv2.drawContours(overlay, [hull], -1, (245, 245, 245), -1)
+
+        # loop over the facial landmark regions individually
+        for (i, name) in enumerate(FACIAL_LANDMARKS_IDXS.keys()):
+            # grab the (x, y)-coordinates associated with the
+            # face landmark
+            (j, k) = FACIAL_LANDMARKS_IDXS[name]
+            pts = shape[j:k]
+     
+            # check if are supposed to draw the jawline
+            if name == "jaw":
+                # since the jawline is a non-enclosed facial region,
+                # just draw lines between the (x, y)-coordinates
+                for l in range(1, len(pts)):
+                    ptA = tuple(pts[l - 1])
+                    ptB = tuple(pts[l])
+                    cv2.line(overlay, ptA, ptB, colors[i], 2)
+     
+            # otherwise, compute the convex hull of the facial
+            # landmark coordinates points and display it
+            else:
+                hull = cv2.convexHull(pts)
+                cv2.drawContours(overlay, [hull], -1, colors[i] , -1)
+
+        overlay[0][0][0] = 0
+        overlay[0][0][1] = 0
+        overlay[0][0][2] = 0
+
+        overlay[127][127][0] = 255
+        overlay[127][127][1] = 255
+        overlay[127][127][2] = 255    
+
+    return overlay
+
     def add_image(self, img):
         if self.print_progress and self.cur_images % self.progress_interval == 0:
             print('%d / %d\r' % (self.cur_images, self.expected_images), end='', flush=True)
+        
+        img = img.transpose(1, 2, 0)
+        dets = detector(img, 1)
+
+        shape = predictor(img, dets[0])
+        shape = face_utils.shape_to_np(shape)
+        key_points = visualize_facial_landmarks(img, shape)
+        img = img.transpose(2, 0, 1)
+        key_points = key_points.transpose(2, 0, 1)
+
         if self.shape is None:
             self.shape = img.shape
             self.resolution_log2 = int(np.log2(self.shape[1]))
@@ -77,10 +149,17 @@ class TFRecordExporter:
             if lod:
                 img = img.astype(np.float32)
                 img = (img[:, 0::2, 0::2] + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
+
+                key_points = key_points.astype(np.float32)
+                key_points = (key_points[:, 0::2, 0::2] + key_points[:, 0::2, 1::2] + key_points[:, 1::2, 0::2] + key_points[:, 1::2, 1::2]) * 0.25
+
             quant = np.rint(img).clip(0, 255).astype(np.uint8)
+            quant2 = np.rint(key_points).clip(0, 255).astype(np.uint8)
+
             ex = tf.train.Example(features=tf.train.Features(feature={
                 'shape': tf.train.Feature(int64_list=tf.train.Int64List(value=quant.shape)),
-                'data': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant.tostring()]))}))
+                'data': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant.tostring()])),
+                'key_points': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant2.tostring()]))}))
             tfr_writer.write(ex.SerializeToString())
         self.cur_images += 1
 
